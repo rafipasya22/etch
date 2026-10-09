@@ -42,7 +42,6 @@ export async function flashEsp32(
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// Intel HEX -> flat byte array (0xFF = erased flash)
 function parseHex(text: string): Uint8Array {
   const buf = new Uint8Array(32768).fill(0xff);
   let base = 0;
@@ -68,7 +67,6 @@ function parseHex(text: string): Uint8Array {
   return buf.slice(0, max);
 }
 
-// STK500v1 upload (Uno / Nano bootloaders)
 async function stk500(
   port: SerialPort,
   baud: number,
@@ -100,7 +98,6 @@ async function stk500(
     return rx.splice(0, n);
   };
 
-  // every STK500 command is answered with INSYNC (0x14) + OK (0x10)
   const cmd = async (bytes: number[], ms = 1000) => {
     rx.length = 0;
     await writer.write(new Uint8Array(bytes));
@@ -110,7 +107,6 @@ async function stk500(
   };
 
   try {
-    // pulse DTR to reset the board into its bootloader
     await port.setSignals({ dataTerminalReady: true, requestToSend: true });
     await sleep(250);
     await port.setSignals({ dataTerminalReady: false, requestToSend: false });
@@ -119,21 +115,21 @@ async function stk500(
     let synced = false;
     for (let i = 0; i < 10 && !synced; i++) {
       try {
-        await cmd([0x30, 0x20], 300); // GET_SYNC
+        await cmd([0x30, 0x20], 300); 
         synced = true;
       } catch {}
     }
     if (!synced) throw new Error(`No bootloader response at ${baud} baud`);
 
-    await cmd([0x50, 0x20]); // ENTER_PROGMODE
+    await cmd([0x50, 0x20]);
 
-    const PAGE = 128; // ATmega328P flash page
+    const PAGE = 128; 
     let lastPct = -10;
     for (let off = 0; off < data.length; off += PAGE) {
       const chunk = data.slice(off, off + PAGE);
       const word = off >> 1;
-      await cmd([0x55, word & 0xff, word >> 8, 0x20]); // LOAD_ADDRESS
-      await cmd([0x64, chunk.length >> 8, chunk.length & 0xff, 0x46, ...chunk, 0x20]); // PROG_PAGE
+      await cmd([0x55, word & 0xff, word >> 8, 0x20]); 
+      await cmd([0x64, chunk.length >> 8, chunk.length & 0xff, 0x46, ...chunk, 0x20]); 
       const pct = Math.floor(((off + chunk.length) / data.length) * 100);
       if (pct >= lastPct + 10) {
         lastPct = pct;
@@ -141,7 +137,7 @@ async function stk500(
       }
     }
 
-    await cmd([0x51, 0x20]); // LEAVE_PROGMODE, board restarts
+    await cmd([0x51, 0x20]);
   } finally {
     running = false;
     try { await reader.cancel(); } catch {}
@@ -158,7 +154,6 @@ export async function flashAvr(
   url: string,
   log: (m: string) => void,
 ) {
-  // Uno: 115200. Nano: new bootloader 115200, old bootloader 57600.
   const bauds =
     fqbn === "arduino:avr:uno" ? [115200]
     : fqbn === "arduino:avr:nano" ? [115200, 57600]

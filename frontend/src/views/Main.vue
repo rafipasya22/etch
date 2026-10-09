@@ -391,13 +391,11 @@ async function loadLocalFile(event: Event) {
       );
       if (!confirmed) return;
 
-      // remove existing .ino before adding new one
       openFiles.value = openFiles.value.filter(
         (f) => !f.filename.toLowerCase().endsWith(".ino"),
       );
     }
 
-    // replace if same filename exists, else add new
     const existingIndex = openFiles.value.findIndex(
       (f) => f.filename.toLowerCase() === lower,
     );
@@ -540,7 +538,7 @@ async function uploadCode() {
   if (!fqbn) return alert("Select a board type first.");
 
   try {
-    if (serialConnected.value) await closeSerial(); // the port must be free
+    if (serialConnected.value) await closeSerial();
 
     await compileCode();
     if (!compileResult.value?.success || !compileResult.value.build_id) return;
@@ -706,7 +704,7 @@ async function closeSerial() {
   } catch {}
   try {
     await readLoop;
-  } catch {} // wait for the lock to be released
+  } catch {}
   try {
     await serialPort?.close();
   } catch {}
@@ -1087,9 +1085,60 @@ function promptCreateFolder() {
 // ============================================================
 const profileFileInput = ref<HTMLInputElement | null>(null);
 const uploadingProfilePhoto = ref(false);
+const newEmail = ref("");
+const newPass = ref("");
+const confPass = ref("");
+
+watch(
+  user,
+  (u) => {
+    if (u?.email) newEmail.value = u.email;
+  },
+  { immediate: true },
+);
 
 function openProfilePhotoPicker() {
   profileFileInput.value?.click();
+}
+
+async function updateEmail() {
+  if (!user.value || newEmail.value === user.value.email) return;
+
+  const { error } = await supabase.auth.updateUser({ email: newEmail.value });
+
+  if (error) {
+    if (
+      error.code === "email_exists" ||
+      /already.*registered/i.test(error.message)
+    ) {
+      throw new Error("Email is already registered");
+    }
+    throw error;
+  }
+
+  msg.value = "Confirmation link sent, check your inbox";
+}
+
+async function updatePass() {
+  if (!user.value || !newPass.value) return;
+  if (newPass.value.length < 6) {
+    throw new Error("Password too short!");
+  }
+  if (newPass.value != confPass.value) {
+    throw new Error("Password doesn't match");
+  }
+
+  try {
+    const { error } = await supabase.auth.updateUser({
+      password: newPass.value,
+    });
+    if (error) throw error;
+  } catch (error) {
+    msg.value = "Updating password failed";
+  } finally {
+    newPass.value = "";
+    confPass.value = "";
+  }
 }
 
 async function handleProfilePhotoUpload(event: Event) {
@@ -1123,7 +1172,7 @@ async function handleProfilePhotoUpload(event: Event) {
 
     if (uploadError) {
       console.error("UPLOAD ERROR:", uploadError);
-      console.log("MEMEMEK");
+      msg.value = "Uploading profile picture failed " + uploadError;
       throw uploadError;
     }
 
@@ -1140,6 +1189,7 @@ async function handleProfilePhotoUpload(event: Event) {
 
     if (updateError) {
       console.error("PROFILE UPDATE ERROR:", updateError);
+      msg.value = "Updating profile picture failed " + updateError;
       throw updateError;
     }
 
@@ -1148,7 +1198,6 @@ async function handleProfilePhotoUpload(event: Event) {
     }
   } catch (error) {
     console.error("Profile picture upload failed:", error);
-    alert("Failed to upload profile picture.");
   } finally {
     uploadingProfilePhoto.value = false;
     input.value = "";
@@ -1159,6 +1208,7 @@ async function showUpdateConf() {
   showConf.value = true;
   await new Promise((resolve) => setTimeout(resolve, 3000));
   showConf.value = false;
+  msg.value = "";
 }
 
 async function updateProfile() {
@@ -1179,14 +1229,19 @@ async function updateProfile() {
 
     if (updateError) {
       console.error("PROFILE UPDATE ERROR:", updateError);
+      msg.value = "Updating profile error " + updateError;
       throw updateError;
     }
 
+    await updateEmail();
+
+    await updatePass();
+
     updateStatus.value = "success";
+    msg.value = "Profile update successful!";
   } catch (error) {
-    console.error("Profile picture upload failed:", error);
-    alert("Failed to upload profile picture.");
     updateStatus.value = "failed";
+    msg.value = (error as Error).message || "Update failed";
   } finally {
     isUpdating.value = false;
     showUpdateConf();
@@ -1232,7 +1287,7 @@ function handleKeyboardShortcuts(event: KeyboardEvent) {
 }
 
 // ============================================================
-// =LIBRARIES
+// LIBRARIES
 // ============================================================
 
 const isLibsOpen = ref(false);
@@ -1439,7 +1494,7 @@ onMounted(() => {
                   <input
                     v-if="user != null"
                     type="text"
-                    v-model="user.email"
+                    v-model="newEmail"
                     class="w-full bg-[#1a1a1a] border border-[#323232] rounded-lg px-3 py-2 text-sm outline-none focus:border-[#ff4400]"
                   />
                 </div>
@@ -1452,6 +1507,7 @@ onMounted(() => {
 
                   <input
                     type="password"
+                    v-model="newPass"
                     class="w-full bg-[#1a1a1a] border border-[#323232] rounded-lg px-3 py-2 text-sm outline-none focus:border-[#ff4400]"
                   />
                 </div>
@@ -1463,6 +1519,7 @@ onMounted(() => {
 
                   <input
                     type="password"
+                    v-model="confPass"
                     class="w-full bg-[#1a1a1a] border border-[#323232] rounded-lg px-3 py-2 text-sm outline-none focus:border-[#ff4400]"
                   />
                 </div>
@@ -1472,7 +1529,6 @@ onMounted(() => {
         </div>
         <div class="flex flex-row justify-end items-center w-full">
           <button
-            @click="updateProfile"
             v-if="isUpdating"
             class="px-4 py-2 mt-2 rounded-lg bg-[#ff4400] hover:bg-[#bf3402] text-sm cursor-pointer h-10 w-30 justify-center items-center flex pointer-events-none"
           >
@@ -1530,13 +1586,7 @@ onMounted(() => {
       >
         cancel
       </span>
-      {{
-        updateStatus == "success"
-          ? "Update Successful!"
-          : updateStatus == "failed"
-            ? "Update Failed!"
-            : ""
-      }}
+      {{ msg }}
     </div>
     <!--Alert-->
     <div
