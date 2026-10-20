@@ -9,7 +9,6 @@ type JsonRpcMessage = {
 
 export class LspClient {
   private ws: WebSocket;
-  private buffer = "";
   private nextId = 1;
   private pending = new Map<
     number,

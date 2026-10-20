@@ -120,7 +120,7 @@ let editor: monaco.editor.IStandaloneCodeEditor | null = null;
 
 const models = new Map<string, monaco.editor.ITextModel>();
 
-function languageForFilename(filename: string): string {
+function languageForFilename(): string {
   return "cpp";
 }
 
@@ -130,7 +130,7 @@ function getOrCreateModel(file: SketchFile): monaco.editor.ITextModel {
   if (!model) {
     model = monaco.editor.createModel(
       file.content,
-      languageForFilename(file.filename),
+      languageForFilename(),
     );
 
     console.log("[Editor] model created, language:", model.getLanguageId());

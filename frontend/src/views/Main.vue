@@ -2,13 +2,14 @@
 // ============================================================
 // IMPORTS
 // ============================================================
-import { watch, computed, nextTick, onMounted, ref } from "vue";
 import Editor from "../components/Editor.vue";
 import BlockEditor from "../components/Blockeditor.vue";
 import FolderTree from "../components/Tree.vue";
 import { supabase } from "../lib/supabase";
 import { useAuth } from "../stores/auth";
 import Libs from "../components/Libs.vue";
+import { watch, computed, nextTick, onMounted, ref, markRaw } from "vue";
+import { flashEsp32, flashAvr } from "../lib/flasher";
 
 // ============================================================
 // PROPS
@@ -26,6 +27,7 @@ const props = withDefaults(
   },
 );
 
+const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 const radius = computed(() => 25 - props.strokeWidth / 2);
 const circumference = computed(() => 2 * Math.PI * radius.value);
 
@@ -122,7 +124,7 @@ const MIN_HEIGHT = 110;
 const MAX_HEIGHT = 300;
 const height = ref(MIN_HEIGHT);
 
-function startResize(e: MouseEvent) {
+function startResize() {
   if (!box.value) return;
 
   const rect = box.value.getBoundingClientRect();
@@ -222,7 +224,6 @@ function addFile() {
   const joined = newFileName.value + ext.value;
   const trimmed = joined.trim();
   const lower = trimmed.toLowerCase();
-  const validExt = [".ino", ".h", ".hpp", ".cpp"];
   isCreatingFile.value = true;
 
   try {
@@ -437,54 +438,64 @@ function saveProjectToPC() {
 // ============================================================
 interface Board {
   port: string;
-  label: string;
-  protocol: string;
-  protocol_label: string;
-  vid: string | null;
-  pid: string | null;
-  serial_number: string | null;
   board: string | null;
   fqbn: string | null;
   identified: boolean;
+  handle: SerialPort;
 }
+
+const USB_IDS: Record<string, { board: string; fqbn: string }> = {
+  "10c4:ea60": { board: "ESP32 Dev Module", fqbn: "esp32:esp32:esp32" },
+  "1a86:55d4": { board: "ESP32 (CH9102)", fqbn: "esp32:esp32:esp32" },
+  "303a:1001": { board: "ESP32-S3 (native USB)", fqbn: "esp32:esp32:esp32s3" },
+  "1a86:7523": { board: "Arduino Uno", fqbn: "arduino:avr:uno" },
+  "2341:0043": { board: "Arduino Uno", fqbn: "arduino:avr:uno" },
+};
+
+const BOARD_OPTIONS = [
+  { label: "ESP32 Dev Module", fqbn: "esp32:esp32:esp32" },
+  { label: "ESP32-S3 Dev Module", fqbn: "esp32:esp32:esp32s3" },
+  { label: "ESP32-C3 Dev Module", fqbn: "esp32:esp32:esp32c3" },
+  { label: "Arduino Uno", fqbn: "arduino:avr:uno" },
+  { label: "Arduino Nano", fqbn: "arduino:avr:nano" },
+  { label: "Arduino Mega 2560", fqbn: "arduino:avr:mega" },
+];
+
+const manualFqbn = ref(localStorage.getItem("manualFqbn") ?? "");
+
+const activeFqbn = computed(
+  () => manualFqbn.value || selectedBoard.value?.fqbn || null,
+);
+
+watch(manualFqbn, (v) => localStorage.setItem("manualFqbn", v));
 
 const boards = ref<Board[]>([]);
 const selectedBoard = ref<Board | null>(null);
 const loadingBoards = ref(false);
 
-async function getBoards(): Promise<Board[]> {
-  const response = await fetch("http://127.0.0.1:8000/boards");
-
-  if (!response.ok) {
-    throw new Error("Failed to detect boards");
-  }
-
-  const data = await response.json();
-  console.log(data);
-
-  return data.boards;
-}
-
-function getFqbn(board: Board): string | null {
-  return board.fqbn;
+function toBoard(port: SerialPort, i: number): Board {
+  const { usbVendorId: v, usbProductId: p } = port.getInfo();
+  const key =
+    v !== undefined && p !== undefined
+      ? `${v.toString(16).padStart(4, "0")}:${p.toString(16).padStart(4, "0")}`
+      : "";
+  const known = USB_IDS[key];
+  return {
+    port: key ? `USB ${key}` : `Port ${i + 1}`,
+    board: known?.board ?? null,
+    fqbn: known?.fqbn ?? null,
+    identified: !!known,
+    handle: markRaw(port),
+  };
 }
 
 async function detectBoards() {
   loadingBoards.value = true;
-
   try {
-    boards.value = await getBoards();
-
-    if (boards.value.length === 0) {
-      selectedBoard.value = null;
-      return;
-    }
-
-    const identifiedBoard = boards.value.find(
-      (board) => board.identified && board.fqbn,
-    );
-
-    selectedBoard.value = identifiedBoard ?? boards.value[0];
+    const ports = await navigator.serial.getPorts();
+    boards.value = ports.map(toBoard);
+    selectedBoard.value =
+      boards.value.find((b) => b.identified) ?? boards.value[0] ?? null;
   } catch (error) {
     console.error("Board detection failed:", error);
     boards.value = [];
@@ -492,6 +503,15 @@ async function detectBoards() {
   } finally {
     loadingBoards.value = false;
   }
+}
+
+async function addBoard() {
+  try {
+    await navigator.serial.requestPort();
+  } catch {
+    return;
+  }
+  await detectBoards();
 }
 
 // ============================================================
@@ -504,10 +524,56 @@ const uploadResult = ref<any>(null);
 
 function downloadFirmware() {
   if (!compileResult.value?.build_id) return;
+  window.open(
+    `${API}/build/${compileResult.value.build_id}/firmware`,
+    "_blank",
+  );
+}
 
-  const buildId = compileResult.value.build_id;
+async function uploadCode() {
+  const board = selectedBoard.value;
+  if (!board) return alert("Please select a port.");
 
-  window.open(`http://127.0.0.1:8000/build/${buildId}/firmware`, "_blank");
+  const fqbn = activeFqbn.value;
+  if (!fqbn) return alert("Select a board type first.");
+
+  try {
+    if (serialConnected.value) await closeSerial();
+
+    await compileCode();
+    if (!compileResult.value?.success || !compileResult.value.build_id) return;
+
+    const url = `${API}/build/${compileResult.value.build_id}/firmware`;
+    const log = (m: string) => {
+      compileResult.value.upload_output += m + "\n";
+      scrollBuildOutput();
+    };
+
+    uploading.value = true;
+    compileResult.value.upload_output = "";
+
+    try {
+      if (fqbn.startsWith("esp32:")) {
+        await flashEsp32(board.handle, url, log);
+      } else if (fqbn === "arduino:avr:uno" || fqbn === "arduino:avr:nano") {
+        await flashAvr(board.handle, fqbn, url, log);
+      } else {
+        throw new Error(`Flashing ${fqbn} is not supported yet.`);
+      }
+      compileResult.value.message = "Upload successful!";
+    } catch (e) {
+      compileResult.value.success = false;
+      compileResult.value.error = `Upload failed: ${e}`;
+    }
+  } catch (e) {
+    compileResult.value = {
+      ...(compileResult.value ?? {}),
+      success: false,
+      error: `Upload failed: ${e}`,
+    };
+  } finally {
+    uploading.value = false;
+  }
 }
 
 async function compileCode() {
@@ -516,9 +582,9 @@ async function compileCode() {
     return;
   }
 
-  const fqbn = getFqbn(selectedBoard.value);
+  const fqbn = activeFqbn.value;
   if (!fqbn) {
-    alert("Unknown board. Please select a board type.");
+    alert("Select a board type first.");
     return;
   }
 
@@ -533,7 +599,7 @@ async function compileCode() {
   uploadResult.value = null;
 
   try {
-    const response = await fetch("http://127.0.0.1:8000/compile", {
+    const response = await fetch(`${API}/compile`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -545,126 +611,24 @@ async function compileCode() {
       }),
     });
 
-    compileResult.value = await response.json();
-    console.log("Compile result:", compileResult.value);
+    const data = await response.json();
+
+    if (!response.ok || !data.success) {
+      const d = data.detail;
+      data.success = false;
+      data.error =
+        data.stderr ||
+        data.stdout ||
+        (typeof d === "string" ? d : d?.message) ||
+        `Compile failed (HTTP ${response.status})`;
+    }
+    compileResult.value = data;
   } catch (error) {
     compileResult.value = {
       success: false,
-      stderr: "Failed to connect to compiler server.",
+      error: "Failed to connect to compiler server.",
     };
   } finally {
-    compiling.value = false;
-  }
-}
-
-async function uploadCode() {
-  const board = selectedBoard.value;
-  if (!board) {
-    alert("Please select a board.");
-    return;
-  }
-
-  const fqbn = getFqbn(board);
-  if (!fqbn) {
-    alert("Unknown board. Please select a board type.");
-    return;
-  }
-
-  if (!hasInoFile()) {
-    alert("Project must have a .ino file.");
-    return;
-  }
-
-  selectOutput.value = "build";
-  compileResult.value = { success: true, upload_output: "" };
-  uploadResult.value = null;
-  compiling.value = true;
-  uploading.value = false;
-
-  try {
-    const response = await fetch("http://127.0.0.1:8000/upload", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        files: openFiles.value.map((f) => ({
-          filename: f.filename,
-          content: f.content,
-        })),
-        fqbn: fqbn,
-        port: board.port,
-      }),
-    });
-
-    compiling.value = false;
-    uploading.value = true;
-
-    if (!response.ok) {
-      const error = await response.json();
-      compileResult.value = {
-        success: false,
-        error: error.detail?.message || "Upload failed",
-      };
-      return;
-    }
-
-    if (!response.body) {
-      throw new Error("No response stream.");
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const events = buffer.split("\n\n");
-      buffer = events.pop() || "";
-
-      for (const event of events) {
-        if (!event.startsWith("data:")) continue;
-        const json = event.replace(/^data:\s*/, "");
-
-        try {
-          const data = JSON.parse(json);
-
-          if (data.type === "compile") {
-            compileResult.value.compile_output = data.message;
-            scrollBuildOutput();
-          }
-          if (data.type === "status") {
-            compileResult.value.upload_output += `\n${data.message}\n`;
-            scrollBuildOutput();
-          }
-          if (data.type === "log") {
-            compileResult.value.upload_output += data.message + "\n";
-            scrollBuildOutput();
-          }
-          if (data.type === "success") {
-            compileResult.value.success = true;
-            compileResult.value.message = data.message;
-            compileResult.value.build_id = data.build_id;
-            scrollBuildOutput();
-          }
-          if (data.type === "error") {
-            compileResult.value.success = false;
-            compileResult.value.error = data.message;
-          }
-        } catch (error) {
-          console.error("Failed to parse SSE:", error);
-        }
-      }
-    }
-  } catch (error) {
-    console.error(error);
-    compileResult.value = {
-      success: false,
-      error: "Could not connect to backend.",
-    };
-  } finally {
-    uploading.value = false;
     compiling.value = false;
   }
 }
@@ -678,8 +642,6 @@ const serialInput = ref("");
 const baudRate = ref(115200);
 const serialOutputRef = ref<HTMLElement | null>(null);
 
-let serialSocket: WebSocket | null = null;
-
 async function scrollSerialOutput() {
   await nextTick();
 
@@ -688,94 +650,66 @@ async function scrollSerialOutput() {
   }
 }
 
-async function openSerial() {
-  const board = selectedBoard.value;
+let serialPort: SerialPort | null = null;
+let serialReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+let readLoop: Promise<void> | null = null;
 
-  if (!board) {
-    alert("Please select a board.");
-    return;
+async function readSerialLoop() {
+  const decoder = new TextDecoder();
+  while (serialPort?.readable && serialConnected.value) {
+    serialReader = serialPort.readable.getReader();
+    try {
+      while (true) {
+        const { value, done } = await serialReader.read();
+        if (done) break;
+        serialOutput.value += decoder.decode(value, { stream: true });
+        scrollSerialOutput();
+      }
+    } catch (e) {
+      serialOutput.value += `\n[ERROR] ${e}\n`;
+      break;
+    } finally {
+      serialReader.releaseLock();
+    }
   }
-
-  if (serialConnected.value) {
-    return;
-  }
-
-  serialSocket = new WebSocket("ws://127.0.0.1:8000/serial");
-
-  serialSocket.onopen = () => {
-    serialSocket?.send(
-      JSON.stringify({
-        port: board.port,
-        baudrate: baudRate.value,
-      }),
-    );
-  };
-
-  serialSocket.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-
-    if (data.type === "connected") {
-      serialConnected.value = true;
-
-      serialOutput.value += `Connected to ${data.port} @ ${data.baudrate}\n`;
-
-      scrollSerialOutput();
-    }
-
-    if (data.type === "data") {
-      serialOutput.value += data.data;
-
-      scrollSerialOutput();
-    }
-
-    if (data.type === "error") {
-      serialOutput.value += `\n[ERROR] ${data.message}\n`;
-
-      scrollSerialOutput();
-    }
-  };
-
-  serialSocket.onclose = () => {
-    serialConnected.value = false;
-
-    serialOutput.value += "\n[Serial connection closed]\n";
-
-    scrollSerialOutput();
-  };
-
-  serialSocket.onerror = () => {
-    serialConnected.value = false;
-
-    serialOutput.value += "\n[Serial connection error]\n";
-  };
 }
 
-function sendSerial() {
-  if (!serialSocket || serialSocket.readyState !== WebSocket.OPEN) {
-    return;
+async function openSerial() {
+  const board = selectedBoard.value;
+  if (!board) return alert("Please select a board.");
+  if (serialConnected.value) return;
+  try {
+    await board.handle.open({ baudRate: baudRate.value });
+    serialPort = board.handle;
+    serialConnected.value = true;
+    serialOutput.value += `Connected to ${board.port} @ ${baudRate.value}\n`;
+    readLoop = readSerialLoop();
+  } catch (e) {
+    serialOutput.value += `\n[ERROR] ${e}\n`;
   }
+}
 
-  if (!serialInput.value) {
-    return;
-  }
-
-  serialSocket.send(
-    JSON.stringify({
-      type: "write",
-      data: serialInput.value + "\n",
-    }),
-  );
-
+async function sendSerial() {
+  if (!serialPort?.writable || !serialInput.value) return;
+  const writer = serialPort.writable.getWriter();
+  await writer.write(new TextEncoder().encode(serialInput.value + "\n"));
+  writer.releaseLock();
   serialInput.value = "";
 }
 
-function closeSerial() {
-  if (serialSocket) {
-    serialSocket.close();
-    serialSocket = null;
-  }
-
+async function closeSerial() {
   serialConnected.value = false;
+  try {
+    await serialReader?.cancel();
+  } catch {}
+  try {
+    await readLoop;
+  } catch {}
+  try {
+    await serialPort?.close();
+  } catch {}
+  serialPort = null;
+  serialOutput.value += "\n[Serial connection closed]\n";
 }
 
 function clearSerial() {
@@ -1151,9 +1085,60 @@ function promptCreateFolder() {
 // ============================================================
 const profileFileInput = ref<HTMLInputElement | null>(null);
 const uploadingProfilePhoto = ref(false);
+const newEmail = ref("");
+const newPass = ref("");
+const confPass = ref("");
+
+watch(
+  user,
+  (u) => {
+    if (u?.email) newEmail.value = u.email;
+  },
+  { immediate: true },
+);
 
 function openProfilePhotoPicker() {
   profileFileInput.value?.click();
+}
+
+async function updateEmail() {
+  if (!user.value || newEmail.value === user.value.email) return;
+
+  const { error } = await supabase.auth.updateUser({ email: newEmail.value });
+
+  if (error) {
+    if (
+      error.code === "email_exists" ||
+      /already.*registered/i.test(error.message)
+    ) {
+      throw new Error("Email is already registered");
+    }
+    throw error;
+  }
+
+  msg.value = "Confirmation link sent, check your inbox";
+}
+
+async function updatePass() {
+  if (!user.value || !newPass.value) return;
+  if (newPass.value.length < 6) {
+    throw new Error("Password too short!");
+  }
+  if (newPass.value != confPass.value) {
+    throw new Error("Password doesn't match");
+  }
+
+  try {
+    const { error } = await supabase.auth.updateUser({
+      password: newPass.value,
+    });
+    if (error) throw error;
+  } catch (error) {
+    msg.value = "Updating password failed";
+  } finally {
+    newPass.value = "";
+    confPass.value = "";
+  }
 }
 
 async function handleProfilePhotoUpload(event: Event) {
@@ -1187,7 +1172,7 @@ async function handleProfilePhotoUpload(event: Event) {
 
     if (uploadError) {
       console.error("UPLOAD ERROR:", uploadError);
-      console.log("MEMEMEK");
+      msg.value = "Uploading profile picture failed " + uploadError;
       throw uploadError;
     }
 
@@ -1204,6 +1189,7 @@ async function handleProfilePhotoUpload(event: Event) {
 
     if (updateError) {
       console.error("PROFILE UPDATE ERROR:", updateError);
+      msg.value = "Updating profile picture failed " + updateError;
       throw updateError;
     }
 
@@ -1212,7 +1198,6 @@ async function handleProfilePhotoUpload(event: Event) {
     }
   } catch (error) {
     console.error("Profile picture upload failed:", error);
-    alert("Failed to upload profile picture.");
   } finally {
     uploadingProfilePhoto.value = false;
     input.value = "";
@@ -1223,6 +1208,7 @@ async function showUpdateConf() {
   showConf.value = true;
   await new Promise((resolve) => setTimeout(resolve, 3000));
   showConf.value = false;
+  msg.value = "";
 }
 
 async function updateProfile() {
@@ -1243,14 +1229,19 @@ async function updateProfile() {
 
     if (updateError) {
       console.error("PROFILE UPDATE ERROR:", updateError);
+      msg.value = "Updating profile error " + updateError;
       throw updateError;
     }
 
+    await updateEmail();
+
+    await updatePass();
+
     updateStatus.value = "success";
+    msg.value = "Profile update successful!";
   } catch (error) {
-    console.error("Profile picture upload failed:", error);
-    alert("Failed to upload profile picture.");
     updateStatus.value = "failed";
+    msg.value = (error as Error).message || "Update failed";
   } finally {
     isUpdating.value = false;
     showUpdateConf();
@@ -1296,7 +1287,7 @@ function handleKeyboardShortcuts(event: KeyboardEvent) {
 }
 
 // ============================================================
-// =LIBRARIES
+// LIBRARIES
 // ============================================================
 
 const isLibsOpen = ref(false);
@@ -1325,7 +1316,6 @@ watch(
   },
   { immediate: true },
 );
-
 
 // ============================================================
 // LIFECYCLE
@@ -1426,7 +1416,7 @@ onMounted(() => {
               <img
                 v-else
                 class="w-full h-full rounded-full object-cover"
-                src="C:\Users\Asus\Documents\Proj\frontend\src\assets\user.png"
+                src="../assets/user.png"
                 alt=""
               />
               <button
@@ -1504,7 +1494,7 @@ onMounted(() => {
                   <input
                     v-if="user != null"
                     type="text"
-                    v-model="user.email"
+                    v-model="newEmail"
                     class="w-full bg-[#1a1a1a] border border-[#323232] rounded-lg px-3 py-2 text-sm outline-none focus:border-[#ff4400]"
                   />
                 </div>
@@ -1517,6 +1507,7 @@ onMounted(() => {
 
                   <input
                     type="password"
+                    v-model="newPass"
                     class="w-full bg-[#1a1a1a] border border-[#323232] rounded-lg px-3 py-2 text-sm outline-none focus:border-[#ff4400]"
                   />
                 </div>
@@ -1528,6 +1519,7 @@ onMounted(() => {
 
                   <input
                     type="password"
+                    v-model="confPass"
                     class="w-full bg-[#1a1a1a] border border-[#323232] rounded-lg px-3 py-2 text-sm outline-none focus:border-[#ff4400]"
                   />
                 </div>
@@ -1537,7 +1529,6 @@ onMounted(() => {
         </div>
         <div class="flex flex-row justify-end items-center w-full">
           <button
-            @click="updateProfile"
             v-if="isUpdating"
             class="px-4 py-2 mt-2 rounded-lg bg-[#ff4400] hover:bg-[#bf3402] text-sm cursor-pointer h-10 w-30 justify-center items-center flex pointer-events-none"
           >
@@ -1595,13 +1586,7 @@ onMounted(() => {
       >
         cancel
       </span>
-      {{
-        updateStatus == "success"
-          ? "Update Successful!"
-          : updateStatus == "failed"
-            ? "Update Failed!"
-            : ""
-      }}
+      {{ msg }}
     </div>
     <!--Alert-->
     <div
@@ -2026,36 +2011,34 @@ onMounted(() => {
           <option value="blocks">Blocks</option>
         </select>
         <div
-          class="btns flex flex-row justify-start items-center bg-[#121212] rounded-lg w-102 border border-[#323232]"
+          class="btns flex flex-row justify-start items-center bg-[#121212] rounded-lg w-fit px-2 border border-[#323232]"
         >
-          <div class="flex items-center gap-2 ps-2 pe-1 py-1">
+          <div class="flex items-center gap-2 pe-1 py-1">
             <span class="text-xs text-[#5e5e5e]"> Board: </span>
 
             <div
-              class="selectboard flex flex-row justify-start items-center border border-[#323232] rounded-lg w-60 hover:border-[#ff4400] transition-all duration-300 ease"
+              class="selectboard flex flex-row justify-start items-center border border-[#323232] rounded-lg w-fit hover:border-[#ff4400] transition-all duration-300 ease"
             >
               <select
-                v-model="selectedBoard"
-                class="bg-[#121212] px-3 py-2 text-xs text-white outline-none focus:outline-none focus:ring-0 cursor-pointer w-50"
+                v-model="manualFqbn"
+                class="bg-[#121212] px-2 py-2 me-2 text-xs text-white outline-none cursor-pointer w-40 rounded-lg"
               >
-                <option v-if="loadingBoards" :value="null">Detecting...</option>
-
-                <option v-if="boards.length === 0" :value="null">
-                  No Boards Detected
+                <option value="">
+                  Auto ({{ selectedBoard?.board ?? "unknown" }})
                 </option>
                 <option
-                  v-for="board in boards"
-                  :key="board.port"
-                  :value="board"
+                  v-for="b in BOARD_OPTIONS"
+                  :key="b.fqbn"
+                  :value="b.fqbn"
                 >
-                  {{ board.board || "Unknown Board" }} — {{ board.port }}
+                  {{ b.label }}
                 </option>
               </select>
 
               <div class="h-5 w-px bg-[#5e5e5e] mx-1"></div>
 
               <button
-                @click="detectBoards"
+                @click="addBoard"
                 :disabled="loadingBoards"
                 class="bg-[#121212] py-2 text-xs group disabled:opacity-50 flex justify-center items-center cursor-pointer w-10 pe-1"
               >
@@ -2184,7 +2167,7 @@ onMounted(() => {
             <Editor
               :files="openFiles"
               :active-file-id="activeFile?.id ?? null"
-              :fqbn="selectedBoard?.fqbn ?? 'arduino:avr:uno'"
+              :fqbn="activeFqbn ?? 'arduino:avr:uno'"
               @update-content="handleEditorUpdate"
             />
           </div>
@@ -2305,7 +2288,10 @@ onMounted(() => {
                 ✓ {{ compileResult.message }}
               </div>
 
-              <div v-if="compileResult.error" class="mt-3">
+              <div
+                v-if="compileResult.error"
+                class="mt-3 text-red-400 whitespace-pre-wrap"
+              >
                 ✕ {{ compileResult.error }}
               </div>
             </div>

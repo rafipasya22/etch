@@ -12,6 +12,7 @@
     "@supabase/supabase-js": "^2.116.0",
     "@tailwindcss/vite": "^4.3.3",
     "blockly": "^13.3.0",
+    "esptool-js": "^0.7.0",
     "monaco": "^1.201704190613.0",
     "monaco-editor": "^0.56.0",
     "monaco-editor-themes": "^1.0.0",
@@ -26,6 +27,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
+    "@types/w3c-web-serial": "^1.0.8",
     "@vitejs/plugin-vue": "^6.0.8",
     "@vue/tsconfig": "^0.9.1",
     "typescript": "~6.0.2",

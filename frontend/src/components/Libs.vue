@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from "vue";
+
 const emit = defineEmits<{
   libraryChanged: [];
 }>();
@@ -19,9 +20,10 @@ interface InstalledLibrary {
   author: string;
 }
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
 const searchQuery = ref("");
+const searchedQuery = ref("");
 const searchResults = ref<LibrarySearchResult[]>([]);
 const installedLibraries = ref<InstalledLibrary[]>([]);
 
@@ -36,29 +38,23 @@ const installedNames = computed(
   () => new Set(installedLibraries.value.map((l) => l.name)),
 );
 
-let searchDebounce: ReturnType<typeof setTimeout> | null = null;
-
-function onSearchInput() {
-  if (searchDebounce) clearTimeout(searchDebounce);
-
-  searchDebounce = setTimeout(() => {
-    runSearch();
-  }, 350);
-}
-
 async function runSearch() {
   errorMessage.value = null;
 
-  if (!searchQuery.value.trim()) {
+  const q = searchQuery.value.trim();
+  if (!q) {
     searchResults.value = [];
+    searchedQuery.value = "";
     return;
   }
+  if (q.length < 2 || isSearching.value) return;
 
+  searchedQuery.value = q;
   isSearching.value = true;
 
   try {
     const res = await fetch(
-      `${API_BASE}/libraries/search?query=${encodeURIComponent(searchQuery.value)}`,
+      `${API_BASE}/libraries/search?query=${encodeURIComponent(q)}`,
     );
 
     if (!res.ok) throw new Error("Search failed");
@@ -109,7 +105,7 @@ async function installLibrary(name: string, version?: string) {
     }
 
     await fetchInstalled();
-    emit("libraryChanged"); 
+    emit("libraryChanged");
   } catch (e: any) {
     errorMessage.value = e.message ?? `Gagal instal ${name}.`;
   } finally {
@@ -135,7 +131,7 @@ async function uninstallLibrary(name: string) {
     }
 
     await fetchInstalled();
-    emit("libraryChanged"); // <- tambahin ini
+    emit("libraryChanged");
   } catch (e: any) {
     errorMessage.value = e.message ?? `Gagal hapus ${name}.`;
   } finally {
@@ -165,9 +161,9 @@ defineExpose({
       <span class="text-xs text-[#727272]"> Enter Library Name: </span>
       <input
         v-model="searchQuery"
-        @input="onSearchInput"
+        @keyup.enter="runSearch"
         type="text"
-        placeholder="Find librares... (eg. Servo, DHT, LiquidCrystal)"
+        placeholder="Find libraries, then press Enter (eg. Servo, DHT)"
         class="w-80 h-7 px-3 py-2 rounded bg-zinc-800 border border-zinc-700 outline-none focus:border-zinc-500 placeholder-zinc-500 text-xs"
       />
     </div>
@@ -179,9 +175,11 @@ defineExpose({
       {{ errorMessage }}
     </div>
   </div>
+
   <div
     class="flex flex-row justify-start items-start h-[90%] max-h-[90%] w-full"
   >
+    <!-- Installed libraries -->
     <div class="w-[30%] flex flex-col items-stretch h-full gap-0">
       <div class="flex-none h-8">
         <div
@@ -202,6 +200,7 @@ defineExpose({
           </button>
         </div>
       </div>
+
       <div
         class="flex-1 min-h-0 overflow-y-auto custom-scrollbar w-full border-r border-[#323232]"
       >
@@ -219,32 +218,35 @@ defineExpose({
           No Library Installed.
         </div>
 
-        <div
-          v-else
-          v-for="lib in installedLibraries"
-          :key="lib.name"
-          class="px-3 py-3 border-b border-zinc-800 hover:bg-zinc-800/50 flex items-center justify-between gap-2 overflow-y-auto custom-scrollbar"
-        >
-          <div class="min-w-0">
-            <div class="text-sm font-semibold text-zinc-100 truncate">
-              {{ lib.name }}
-            </div>
-            <div class="text-xs text-zinc-500 truncate">
-              {{ lib.author }} · v{{ lib.version }}
-            </div>
-          </div>
-
-          <button
-            @click="uninstallLibrary(lib.name)"
-            :disabled="uninstallingName === lib.name"
-            class="shrink-0 px-3 py-1.5 cursor-pointer rounded bg-zinc-800 hover:bg-red-900/50 disabled:opacity-50 text-xs text-zinc-400 hover:text-red-400 border border-zinc-700"
+        <template v-else>
+          <div
+            v-for="lib in installedLibraries"
+            :key="lib.name"
+            class="px-3 py-3 border-b border-zinc-800 hover:bg-zinc-800/50 flex items-center justify-between gap-2"
           >
-            {{ uninstallingName === lib.name ? "Deleting..." : "Delete" }}
-          </button>
-        </div>
+            <div class="min-w-0">
+              <div class="text-sm font-semibold text-zinc-100 truncate">
+                {{ lib.name }}
+              </div>
+              <div class="text-xs text-zinc-500 truncate">
+                {{ lib.author }} · v{{ lib.version }}
+              </div>
+            </div>
+
+            <button
+              @click="uninstallLibrary(lib.name)"
+              :disabled="uninstallingName === lib.name"
+              class="shrink-0 px-3 py-1.5 cursor-pointer rounded bg-zinc-800 hover:bg-red-900/50 disabled:opacity-50 text-xs text-zinc-400 hover:text-red-400 border border-zinc-700"
+            >
+              {{ uninstallingName === lib.name ? "Deleting..." : "Delete" }}
+            </button>
+          </div>
+        </template>
       </div>
     </div>
-    <div class="w-[70%] h-full flex flex-col items-stretch h-full gap-0">
+
+    <!-- Search results -->
+    <div class="w-[70%] h-full flex flex-col items-stretch gap-0">
       <div class="flex-none h-8">
         <div
           class="px-3 py-2 text-xs tracking-wide text-zinc-500 sticky top-0 bg-zinc-900 h-8 max-h-8 w-full"
@@ -252,6 +254,7 @@ defineExpose({
           Search Result
         </div>
       </div>
+
       <div class="flex-1 min-h-0 overflow-y-auto custom-scrollbar w-full">
         <div
           v-if="isSearching"
@@ -271,55 +274,56 @@ defineExpose({
         </div>
 
         <div
-          v-else-if="searchResults.length === 0 && searchQuery.length === 0"
+          v-else-if="searchResults.length === 0 && !searchedQuery"
           class="px-3 py-4 text-zinc-500 w-full h-full flex justify-center items-center"
         >
-          Please type library name to start searching
+          Type a library name and press Enter to search
         </div>
 
         <div
           v-else-if="searchResults.length === 0"
           class="px-3 py-4 text-zinc-500 w-full h-full flex justify-center items-center"
         >
-          Query not found.
+          No results for "{{ searchedQuery }}".
         </div>
 
-        <div
-          v-else
-          v-for="lib in searchResults"
-          :key="lib.name"
-          class="px-3 py-3 border-b border-zinc-800 hover:bg-zinc-800/50 cursor-pointer"
-        >
-          <div class="flex items-start justify-between gap-2">
-            <div class="min-w-0">
-              <div class="text-sm font-semibold text-zinc-100 truncate">
-                {{ lib.name }}
+        <template v-else>
+          <div
+            v-for="lib in searchResults"
+            :key="lib.name"
+            class="px-3 py-3 border-b border-zinc-800 hover:bg-zinc-800/50"
+          >
+            <div class="flex items-start justify-between gap-2">
+              <div class="min-w-0">
+                <div class="text-sm font-semibold text-zinc-100 truncate">
+                  {{ lib.name }}
+                </div>
+                <div class="text-xs text-zinc-500 truncate">
+                  {{ lib.author }} · v{{ lib.latest_version }}
+                </div>
+                <div class="text-xs text-zinc-400 mt-1 line-clamp-2">
+                  {{ lib.sentence }}
+                </div>
               </div>
-              <div class="text-xs text-zinc-500 truncate">
-                {{ lib.author }} · v{{ lib.latest_version }}
-              </div>
-              <div class="text-xs text-zinc-400 mt-1 line-clamp-2">
-                {{ lib.sentence }}
-              </div>
+
+              <button
+                v-if="!isInstalled(lib.name)"
+                @click="installLibrary(lib.name, lib.latest_version)"
+                :disabled="installingName === lib.name"
+                class="shrink-0 px-3 py-1.5 cursor-pointer rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed text-xs whitespace-nowrap"
+              >
+                {{ installingName === lib.name ? "Installing..." : "Install" }}
+              </button>
+
+              <span
+                v-else
+                class="shrink-0 px-3 py-1.5 rounded bg-zinc-800 text-zinc-400 text-xs whitespace-nowrap border border-zinc-700"
+              >
+                Installed
+              </span>
             </div>
-
-            <button
-              v-if="!isInstalled(lib.name)"
-              @click="installLibrary(lib.name, lib.latest_version)"
-              :disabled="installingName === lib.name"
-              class="shrink-0 px-3 py-1.5 cursor-pointer rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed text-xs whitespace-nowrap"
-            >
-              {{ installingName === lib.name ? "Installing..." : "Install" }}
-            </button>
-
-            <span
-              v-else
-              class="shrink-0 px-3 py-1.5 rounded bg-zinc-800 text-zinc-400 text-xs whitespace-nowrap border border-zinc-700"
-            >
-              Installed
-            </span>
           </div>
-        </div>
+        </template>
       </div>
     </div>
   </div>

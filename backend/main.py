@@ -15,6 +15,7 @@ import sys
 import asyncio
 import shlex
 
+import time
 import re
 
 _board_flags_cache: dict[str, list[str]] = {}
@@ -118,8 +119,15 @@ def root():
     }
 
 
+def cleanup_old_builds(max_age_s: int = 3600):
+    now = time.time()
+    for d in BUILD_DIR.iterdir():
+        if d.is_dir() and now - d.stat().st_mtime > max_age_s:
+            shutil.rmtree(d, ignore_errors=True)
+
 @app.post("/compile")
 def compile_code(request: CompileRequest):
+    cleanup_old_builds()
     ensure_libraries_installed(request.libraries)
 
     build_id = str(uuid.uuid4())
@@ -128,15 +136,20 @@ def compile_code(request: CompileRequest):
 
     main_ino_written = False
 
+    ALLOWED_EXT = {".ino", ".h", ".hpp", ".cpp"}
+
     for f in request.files:
-        if f.filename.lower().endswith(".ino"):
-            target_name = f"{build_id}.ino" if not main_ino_written else f.filename
+        name = Path(f.filename).name          
+        if Path(name).suffix.lower() not in ALLOWED_EXT:
+            raise HTTPException(400, f"Unsupported file: {name}")
+
+        if name.lower().endswith(".ino") and not main_ino_written:
+            target_name = f"{build_id}.ino"
             main_ino_written = True
         else:
-            target_name = f.filename
+            target_name = name
 
-        file_path = project_path / target_name
-        file_path.write_text(f.content, encoding="utf-8")
+        (project_path / target_name).write_text(f.content, encoding="utf-8")
 
     if not main_ino_written:
         shutil.rmtree(project_path)
@@ -166,30 +179,23 @@ def compile_code(request: CompileRequest):
     }
 
 
+
+
 @app.get("/build/{build_id}/firmware")
 def download_firmware(build_id: str):
+    uuid.UUID(build_id)  
+    build_path = BUILD_DIR / build_id / "build"
+    files = list(build_path.glob("*")) if build_path.exists() else []
 
-    build_path = Path("builds") / build_id / "build"
-
-    firmware_files = [
-        file
-        for file in build_path.iterdir()
-        if file.suffix.lower() in [".hex", ".bin"]
-    ]
-
-    if not firmware_files:
-        return {
-            "success": False,
-            "message": "Firmware not found"
-        }
-
-    firmware = firmware_files[0]
-
-    return FileResponse(
-        path=firmware,
-        filename=firmware.name,
-        media_type="application/octet-stream"
+    fw = (
+        next((f for f in files if f.name.endswith(".merged.bin")), None)
+        or next((f for f in files if f.suffix == ".hex" and "with_bootloader" not in f.name), None)
+        or next((f for f in files if f.suffix == ".bin"), None)
     )
+    if not fw:
+        raise HTTPException(404, "Firmware not found")
+
+    return FileResponse(fw, filename=fw.name, media_type="application/octet-stream")
 
 
 @app.post("/upload")
