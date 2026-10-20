@@ -1765,7 +1765,7 @@ onMounted(() => {
         <h1
           class="text-lg text-[#ff4400] font-semibold whitespace-nowrap my-2 p-3"
         >
-          Serial <span class="text-white"> Flasher </span>
+          Et<span class="text-white">ch</span>
         </h1>
         <div
           class="content flex flex-col justify-start items-start h-full w-full gap-3 px-3 py-1"
