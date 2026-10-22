@@ -112,9 +112,9 @@ uvicorn main:app --reload --port 8000
 
 | Variable | Description |
 |---|---|
-| `VITE_API_URL` | Backend base URL, with no trailing slash. Defaults to `http://localhost:8000`. |
+| `VITE_API_URL` | Backend base URL. Defaults to `http://localhost:8000`. |
 | `VITE_SUPABASE_URL` | Your Supabase project URL. |
-| `VITE_SUPABASE_ANON_KEY` | Your Supabase anon (public) key. Never use the `service_role` key here. |
+| `VITE_SUPABASE_ANON_KEY` | Your Supabase anon (public) key. |
 
 Vite inlines these at build time, so changing them requires a rebuild or redeploy.
 
@@ -122,7 +122,7 @@ Vite inlines these at build time, so changing them requires a rebuild or redeplo
 
 | Variable | Default | Description |
 |---|---|---|
-| `ALLOWED_ORIGINS` | `http://localhost:5173` | Comma-separated list of frontend origins allowed by CORS. No trailing slashes. |
+| `ALLOWED_ORIGINS` | `http://localhost:5173` | Comma-separated list of frontend origins allowed by CORS. |
 | `ENABLE_LSP` | `true` | Enables the `/lsp/clangd` websocket for autocomplete. |
 | `ALLOW_LIB_UNINSTALL` | `false` | Allows the library uninstall endpoint. |
 | `MAX_CONCURRENT_COMPILES` | `2` | Maximum compiles running at the same time. Extra requests get a 429. |
