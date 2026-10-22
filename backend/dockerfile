@@ -1,15 +1,52 @@
 FROM python:3.13-slim
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates \
+        curl ca-certificates clangd \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
        | BINDIR=/usr/local/bin sh
 
-COPY . .
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+RUN useradd -m app \
+    && mkdir -p /home/app/Arduino/libraries \
+    && chown -R app:app /app /home/app
+USER app
+
+ARG ESP32_CORE_VERSION=""
+
+RUN arduino-cli config init \
+ && arduino-cli config add board_manager.additional_urls \
+    https://espressif.github.io/arduino-esp32/package_esp32_index.json \
+ && arduino-cli core update-index \
+ && arduino-cli core install arduino:avr "esp32:esp32${ESP32_CORE_VERSION:+@$ESP32_CORE_VERSION}" \
+ && rm -rf /home/app/.arduino15/staging \
+ && find /home/app/.arduino15/packages/esp32 -type d \( \
+        -name '*esp32s2*' -o -name '*esp32c2*' -o -name '*esp32c5*' \
+        -o -name '*esp32c6*' -o -name '*esp32h2*' -o -name '*esp32p4*' \
+        -o -name '*gdb*' -o -name 'openocd*' \
+    \) -prune -exec rm -rf {} + \
+ ; true
+
+ARG VERIFY_BOARDS=false
+RUN if [ "$VERIFY_BOARDS" = "true" ]; then \
+      mkdir -p /tmp/probe \
+      && printf 'void setup(){}\nvoid loop(){}\n' > /tmp/probe/probe.ino \
+      && for b in esp32:esp32:esp32 esp32:esp32:esp32s3 esp32:esp32:esp32c3 \
+                  arduino:avr:uno arduino:avr:nano arduino:avr:mega; do \
+           arduino-cli compile --fqbn "$b" /tmp/probe || exit 1; \
+         done; \
+      rm -rf /tmp/probe /tmp/arduino*; \
+    fi
+
+COPY --chown=app:app . .
+
 EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s \
+  CMD curl -fs http://localhost:${PORT:-8000}/health || exit 1
+
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

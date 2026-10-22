@@ -1,33 +1,56 @@
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
-from pathlib import Path
-import uuid
+import asyncio
+import json
+import os
+import re
 import shutil
 import subprocess
-from fastapi.responses import FileResponse, StreamingResponse
-from compile import compile_arduino
-from fastapi.middleware.cors import CORSMiddleware
-import json
-import serial
+import sys
 import threading
 import time
-import sys
-import asyncio
-import shlex
+import uuid
+from collections import defaultdict, deque
+from pathlib import Path
 
-import time
-import re
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
-_board_flags_cache: dict[str, list[str]] = {}
+from compile import compile_arduino
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+# CONFIG 
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    if o.strip()
+]
+ENABLE_LSP = os.getenv("ENABLE_LSP", "true").lower() == "true"
+ALLOW_LIB_UNINSTALL = os.getenv("ALLOW_LIB_UNINSTALL", "false").lower() == "true"
+MAX_CONCURRENT_COMPILES = int(os.getenv("MAX_CONCURRENT_COMPILES", "2"))
+
+ALLOWED_FQBN = {
+    "esp32:esp32:esp32",
+    "esp32:esp32:esp32s3",
+    "esp32:esp32:esp32c3",
+    "arduino:avr:uno",
+    "arduino:avr:nano",
+    "arduino:avr:mega",
+}
+ALLOWED_EXT = {".ino", ".h", ".hpp", ".cpp"}
+MAX_FILES = 20
+MAX_TOTAL_BYTES = 500_000
+MAX_LIBS = 10
+LIB_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-+]{0,99}$")
+LIB_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-+]{0,29}$")
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,24 +62,11 @@ CLANGD_WORKSPACES.mkdir(exist_ok=True)
 BUILD_DIR = Path("builds")
 BUILD_DIR.mkdir(exist_ok=True)
 
-PROJECTS_DIR = Path("projects")
-PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+_board_flags_cache: dict[str, list[str]] = {}
+compile_slots = threading.BoundedSemaphore(MAX_CONCURRENT_COMPILES)
 
 
-class ProjectRequest(BaseModel):
-    name: str
-    code: str
-
-
-class ProjectRenameRequest(BaseModel):
-    name: str
-
-
-class ProjectUpdateRequest(BaseModel):
-    name: str
-    code: str
-
-
+# MODELS
 class SketchFile(BaseModel):
     filename: str
     content: str
@@ -65,13 +75,6 @@ class SketchFile(BaseModel):
 class CompileRequest(BaseModel):
     board: str
     files: list[SketchFile]
-    libraries: list[str] = []
-
-
-class UploadRequest(BaseModel):
-    files: list[SketchFile]
-    fqbn: str
-    port: str
     libraries: list[str] = []
 
 
@@ -84,39 +87,52 @@ class LibraryUninstallRequest(BaseModel):
     name: str
 
 
-ss = {
-    ("0x10C4", "0xEA60"): {
-        "board": "ESP32 Dev Module",
-        "fqbn": "esp32:esp32:esp32",
-    },
-    ("0x1A86", "0x7523"): {
-        "board": "Arduino Uno",
-        "fqbn": "arduino:avr:uno",
-    },
-}
+# HELPER
+_hits: dict[str, deque] = defaultdict(deque)
+
+
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def rate_limit(max_calls: int, per_seconds: int):
+
+    def dep(request: Request):
+        key = f"{request.url.path}:{client_ip(request)}"
+        now = time.time()
+        q = _hits[key]
+        while q and q[0] < now - per_seconds:
+            q.popleft()
+        if len(q) >= max_calls:
+            raise HTTPException(429, "Too many requests, slow down.")
+        q.append(now)
+
+    return dep
 
 
 def run_cli(cmd: list[str]) -> subprocess.CompletedProcess:
-    """Run a subprocess with safe UTF-8 decoding.
-
-    Windows defaults subprocess text decoding to the system codepage
-    (cp1252), which chokes on UTF-8 bytes arduino-cli can emit (special
-    chars in library descriptions, etc). Force UTF-8 and replace any
-    undecodable byte instead of crashing the whole request.
-    """
     return subprocess.run(
         cmd,
         capture_output=True,
         encoding="utf-8",
         errors="replace",
+        timeout=300,
     )
 
 
-@app.get("/")
-def root():
-    return {
-        "message": "Arduino Web Compiler API"
-    }
+def validate_files(files: list[SketchFile]):
+    if not files or len(files) > MAX_FILES:
+        raise HTTPException(400, f"Send between 1 and {MAX_FILES} files.")
+    if sum(len(f.content.encode("utf-8")) for f in files) > MAX_TOTAL_BYTES:
+        raise HTTPException(400, "Project too large.")
+
+
+def validate_lib_name(name: str):
+    if not LIB_NAME_RE.match(name):
+        raise HTTPException(400, f"Invalid library name: {name!r}")
 
 
 def cleanup_old_builds(max_age_s: int = 3600):
@@ -125,65 +141,97 @@ def cleanup_old_builds(max_age_s: int = 3600):
         if d.is_dir() and now - d.stat().st_mtime > max_age_s:
             shutil.rmtree(d, ignore_errors=True)
 
-@app.post("/compile")
+
+def ensure_libraries_installed(libraries: list[str]):
+    if len(libraries) > MAX_LIBS:
+        raise HTTPException(400, f"Too many libraries (max {MAX_LIBS}).")
+    for lib_name in libraries:
+        validate_lib_name(lib_name)
+        result = run_cli(["arduino-cli", "lib", "install", lib_name])
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "stage": "lib_install",
+                    "message": f"Failed installing {lib_name}: {result.stderr or result.stdout}",
+                },
+            )
+
+
+# ROUTE
+@app.get("/")
+def root():
+    return {"message": "Etch"}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+# COMPILE + FIRMWARE
+@app.post("/compile", dependencies=[Depends(rate_limit(10, 60))])
 def compile_code(request: CompileRequest):
-    cleanup_old_builds()
-    ensure_libraries_installed(request.libraries)
+    if request.board not in ALLOWED_FQBN:
+        raise HTTPException(400, "Unsupported board.")
+    validate_files(request.files)
 
-    build_id = str(uuid.uuid4())
-    project_path = Path("builds") / build_id
-    project_path.mkdir(parents=True)
+    if not compile_slots.acquire(blocking=False):
+        raise HTTPException(429, "Server busy, try again in a minute.")
 
-    main_ino_written = False
+    try:
+        cleanup_old_builds()
+        ensure_libraries_installed(request.libraries)
 
-    ALLOWED_EXT = {".ino", ".h", ".hpp", ".cpp"}
+        build_id = str(uuid.uuid4())
+        project_path = BUILD_DIR / build_id
+        project_path.mkdir(parents=True)
 
-    for f in request.files:
-        name = Path(f.filename).name          
-        if Path(name).suffix.lower() not in ALLOWED_EXT:
-            raise HTTPException(400, f"Unsupported file: {name}")
+        main_ino_written = False
 
-        if name.lower().endswith(".ino") and not main_ino_written:
-            target_name = f"{build_id}.ino"
-            main_ino_written = True
-        else:
-            target_name = name
+        for f in request.files:
+            name = Path(f.filename).name
+            if Path(name).suffix.lower() not in ALLOWED_EXT:
+                shutil.rmtree(project_path, ignore_errors=True)
+                raise HTTPException(400, f"Unsupported file: {name}")
 
-        (project_path / target_name).write_text(f.content, encoding="utf-8")
+            if name.lower().endswith(".ino") and not main_ino_written:
+                target_name = f"{build_id}.ino"
+                main_ino_written = True
+            else:
+                target_name = name
 
-    if not main_ino_written:
-        shutil.rmtree(project_path)
+            (project_path / target_name).write_text(f.content, encoding="utf-8")
+
+        if not main_ino_written:
+            shutil.rmtree(project_path, ignore_errors=True)
+            return {"success": False, "stderr": "No .ino file found in project."}
+
+        result = compile_arduino(str(project_path), request.board)
+
+        if not result["success"]:
+            shutil.rmtree(project_path, ignore_errors=True)
+            return result
+
         return {
-            "success": False,
-            "stderr": "No .ino file found in project."
+            "success": True,
+            "build_id": build_id,
+            "firmware": result["firmware_file"].name,
+            "compile_output": result["stdout"],
+            "stderr": result["stderr"],
+            "message": "Compile successful!",
         }
-
-    result = compile_arduino(
-        str(project_path),
-        request.board
-    )
-
-    if not result["success"]:
-        shutil.rmtree(project_path)
-        return result
-
-    firmware_file = result["firmware_file"]
-
-    return {
-        "success": True,
-        "build_id": build_id,
-        "firmware": firmware_file.name,
-        "compile_output": result["stdout"],
-        "stderr": result["stderr"],
-        "message": "Compile successful!"
-    }
-
-
+    finally:
+        compile_slots.release()
 
 
 @app.get("/build/{build_id}/firmware")
 def download_firmware(build_id: str):
-    uuid.UUID(build_id)  
+    try:
+        uuid.UUID(build_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid build id")
+
     build_path = BUILD_DIR / build_id / "build"
     files = list(build_path.glob("*")) if build_path.exists() else []
 
@@ -198,481 +246,14 @@ def download_firmware(build_id: str):
     return FileResponse(fw, filename=fw.name, media_type="application/octet-stream")
 
 
-@app.post("/upload")
-def upload_code(request: UploadRequest):
-    ensure_libraries_installed(request.libraries)
-
-    build_id = str(uuid.uuid4())
-    sketch_dir = BUILD_DIR / build_id
-    sketch_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        main_ino_written = False
-
-        for f in request.files:
-            if f.filename.lower().endswith(".ino"):
-                target_name = f"{build_id}.ino" if not main_ino_written else f.filename
-                main_ino_written = True
-            else:
-                target_name = f.filename
-
-            file_path = sketch_dir / target_name
-            file_path.write_text(f.content, encoding="utf-8")
-
-        if not main_ino_written:
-            raise HTTPException(
-                status_code=400,
-                detail={"message": "No .ino file found in project."}
-            )
-
-        compile_cmd = [
-            "arduino-cli",
-            "compile",
-            "--fqbn",
-            request.fqbn,
-            str(sketch_dir)
-        ]
-
-        compile_result = run_cli(compile_cmd)
-
-        if compile_result.returncode != 0:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "stage": "compile",
-                    "message": (
-                        compile_result.stderr
-                        or compile_result.stdout
-                    )
-                }
-            )
-
-        upload_cmd = [
-            "arduino-cli",
-            "upload",
-            "-v",
-            "-p",
-            request.port,
-            "--fqbn",
-            request.fqbn,
-            str(sketch_dir)
-        ]
-
-        def generate():
-            yield f"data: {json.dumps({
-                'type': 'compile',
-                'message': compile_result.stdout
-            })}\n\n"
-
-            yield f"data: {json.dumps({
-                'type': 'status',
-                'message': 'Starting upload...'
-            })}\n\n"
-
-            process = subprocess.Popen(
-                upload_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1
-            )
-
-            if process.stdout:
-                for line in process.stdout:
-                    line = line.rstrip()
-                    if not line:
-                        continue
-
-                    yield f"data: {json.dumps({
-                        'type': 'log',
-                        'message': line
-                    })}\n\n"
-
-            process.wait()
-
-            if process.returncode == 0:
-                yield f"data: {json.dumps({
-                    'type': 'success',
-                    'message': 'Upload successful!',
-                    'build_id': build_id
-                })}\n\n"
-            else:
-                yield f"data: {json.dumps({
-                    'type': 'error',
-                    'message': 'Upload failed.',
-                    'build_id': build_id
-                })}\n\n"
-
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            }
-        )
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-
-@app.get("/boards")
-def get_boards():
-    try:
-        result = run_cli(
-            ["arduino-cli", "board", "list", "--format", "json"]
-        )
-
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=result.stderr
-            )
-
-        data = json.loads(result.stdout)
-
-        boards = []
-
-        for detected in data.get("detected_ports", []):
-
-            port = detected.get("port", {})
-            matches = detected.get("matching_boards", [])
-
-            address = port.get("address")
-            vid = port.get("properties", {}).get("vid")
-            pid = port.get("properties", {}).get("pid")
-
-            base_info = {
-                "port": address,
-                "label": port.get("label"),
-                "protocol": port.get("protocol"),
-                "protocol_label": port.get("protocol_label"),
-                "vid": vid,
-                "pid": pid,
-                "serial_number": port.get("properties", {}).get("serialNumber"),
-            }
-
-            if matches:
-
-                for match in matches:
-                    boards.append({
-                        **base_info,
-                        "board": match.get("name"),
-                        "fqbn": match.get("fqbn"),
-                        "identified": True,
-                    })
-
-            else:
-
-                known_board = ss.get(
-                    (
-                        vid if vid else None,
-                        pid if pid else None
-                    )
-                )
-
-                if known_board:
-                    boards.append({
-                        **base_info,
-                        "board": known_board["board"],
-                        "fqbn": known_board["fqbn"],
-                        "identified": True,
-                    })
-
-                else:
-                    boards.append({
-                        **base_info,
-                        "board": None,
-                        "fqbn": None,
-                        "identified": False,
-                    })
-
-        return {
-                    "success": True,
-                    "boards": boards
-                }
-
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to parse Arduino CLI response"
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-
-@app.websocket("/serial")
-async def serial_monitor(websocket: WebSocket):
-
-    await websocket.accept()
-
-    ser = None
-
-    try:
-
-        config = await websocket.receive_json()
-
-        port = config.get("port")
-        baudrate = config.get("baudrate", 115200)
-
-        if not port:
-            await websocket.send_json({
-                "type": "error",
-                "message": "No serial port specified"
-            })
-            return
-
-        try:
-
-            ser = serial.Serial(
-                port=port,
-                baudrate=baudrate,
-                timeout=0.05
-            )
-
-        except Exception as e:
-
-            await websocket.send_json({
-                "type": "error",
-                "message": str(e)
-            })
-
-            return
-
-        await websocket.send_json({
-            "type": "connected",
-            "port": port,
-            "baudrate": baudrate
-        })
-
-        async def read_serial():
-
-            while True:
-
-                if ser is None or not ser.is_open:
-                    break
-
-                try:
-
-                    if ser.in_waiting > 0:
-
-                        data = ser.read(
-                            ser.in_waiting
-                        )
-
-                        text = data.decode(
-                            "utf-8",
-                            errors="replace"
-                        )
-
-                        await websocket.send_json({
-                            "type": "data",
-                            "data": text
-                        })
-
-                except Exception as e:
-
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": str(e)
-                    })
-
-                    break
-
-                await asyncio.sleep(0.01)
-
-        async def receive_messages():
-
-            while True:
-
-                message = await websocket.receive_json()
-
-                if message.get("type") == "write":
-
-                    text = message.get(
-                        "data",
-                        ""
-                    )
-
-                    if ser and ser.is_open:
-
-                        ser.write(
-                            text.encode("utf-8")
-                        )
-
-        await asyncio.gather(
-            read_serial(),
-            receive_messages()
-        )
-
-    except WebSocketDisconnect:
-        print("Serial monitor disconnected")
-
-    except Exception as e:
-        print("Serial monitor error:", e)
-
-    finally:
-
-        if ser and ser.is_open:
-            ser.close()
-
-        print("Serial port closed")
-
-
-@app.post("/projects")
-def save_project(request: ProjectRequest):
-
-    project_id = str(uuid.uuid4())
-
-    project_dir = PROJECTS_DIR / project_id
-    project_dir.mkdir(parents=True, exist_ok=True)
-
-    ino_file = project_dir / f"{request.name}.ino"
-
-    ino_file.write_text(
-        request.code,
-        encoding="utf-8"
-    )
-
-    return {
-        "success": True,
-        "project": {
-            "id": project_id,
-            "name": request.name
-        }
-    }
-
-
-@app.get("/projects")
-def get_projects():
-
-    projects = []
-
-    for project_dir in PROJECTS_DIR.iterdir():
-
-        if not project_dir.is_dir():
-            continue
-
-        ino_files = list(
-            project_dir.glob("*.ino")
-        )
-
-        if not ino_files:
-            continue
-
-        ino_file = ino_files[0]
-
-        projects.append({
-            "id": project_dir.name,
-            "name": ino_file.stem,
-            "filename": ino_file.name
-        })
-
-    return {
-        "success": True,
-        "projects": projects
-    }
-
-
-@app.get("/projects/{project_id}")
-def load_project(project_id: str):
-
-    project_dir = PROJECTS_DIR / project_id
-
-    if not project_dir.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Project not found"
-        )
-
-    ino_files = list(
-        project_dir.glob("*.ino")
-    )
-
-    if not ino_files:
-        raise HTTPException(
-            status_code=404,
-            detail="Project source not found"
-        )
-
-    ino_file = ino_files[0]
-
-    return {
-        "success": True,
-        "project": {
-            "id": project_id,
-            "name": ino_file.stem,
-            "filename": ino_file.name,
-            "code": ino_file.read_text(
-                encoding="utf-8"
-            )
-        }
-    }
-
-
-@app.put("/projects/{project_id}")
-def update_project(
-    project_id: str,
-    request: ProjectUpdateRequest
-):
-    project_dir = PROJECTS_DIR / project_id
-
-    if not project_dir.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Project not found"
-        )
-
-    ino_files = list(project_dir.glob("*.ino"))
-
-    if not ino_files:
-        raise HTTPException(
-            status_code=404,
-            detail="Project source not found"
-        )
-
-    old_file = ino_files[0]
-
-    safe_name = Path(request.name).stem
-
-    new_file = project_dir / f"{safe_name}.ino"
-
-    if old_file != new_file:
-        old_file.rename(new_file)
-
-    new_file.write_text(
-        request.code,
-        encoding="utf-8"
-    )
-
-    return {
-        "success": True,
-        "project": {
-            "id": project_id,
-            "name": safe_name,
-            "filename": new_file.name
-        }
-    }
-
-
-@app.get("/libraries/search")
+# LIBS
+@app.get("/libraries/search", dependencies=[Depends(rate_limit(30, 60))])
 def search_libraries(query: str = ""):
-    cmd = ["arduino-cli", "lib", "search", query, "--format", "json"]
+    query = query.strip()
+    if query.startswith("-") or len(query) > 100:
+        raise HTTPException(400, "Invalid query")
 
-    result = run_cli(cmd)
-
+    result = run_cli(["arduino-cli", "lib", "search", query, "--format", "json"])
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=result.stderr)
 
@@ -689,14 +270,12 @@ def search_libraries(query: str = ""):
         }
         for lib in data.get("libraries", [])
     ]
-
     return {"success": True, "libraries": libraries}
 
 
 @app.get("/libraries/installed")
 def list_installed_libraries():
     result = run_cli(["arduino-cli", "lib", "list", "--format", "json"])
-
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=result.stderr)
 
@@ -710,18 +289,16 @@ def list_installed_libraries():
         }
         for item in data.get("installed_libraries", [])
     ]
-
     return {"success": True, "libraries": libraries}
 
 
-@app.post("/libraries/install")
+@app.post("/libraries/install", dependencies=[Depends(rate_limit(10, 60))])
 def install_library(request: LibraryInstallRequest):
-    target = (
-        f"{request.name}@{request.version}"
-        if request.version
-        else request.name
-    )
+    validate_lib_name(request.name)
+    if request.version is not None and not LIB_VERSION_RE.match(request.version):
+        raise HTTPException(400, "Invalid version")
 
+    target = f"{request.name}@{request.version}" if request.version else request.name
     result = run_cli(["arduino-cli", "lib", "install", target])
 
     if result.returncode != 0:
@@ -729,37 +306,40 @@ def install_library(request: LibraryInstallRequest):
             status_code=400,
             detail={"stage": "lib_install", "message": result.stderr or result.stdout},
         )
-
     return {"success": True, "message": f"{target} installed", "output": result.stdout}
 
 
-@app.post("/libraries/uninstall")
+@app.post("/libraries/uninstall", dependencies=[Depends(rate_limit(10, 60))])
 def uninstall_library(request: LibraryUninstallRequest):
-    result = run_cli(["arduino-cli", "lib", "uninstall", request.name])
+    if not ALLOW_LIB_UNINSTALL:
+        raise HTTPException(403, "Uninstall is disabled on this server.")
+    validate_lib_name(request.name)
 
+    result = run_cli(["arduino-cli", "lib", "uninstall", request.name])
     if result.returncode != 0:
         raise HTTPException(
             status_code=400,
             detail={"stage": "lib_uninstall", "message": result.stderr or result.stdout},
         )
-
     return {"success": True, "message": f"{request.name} uninstalled"}
 
 
-def ensure_libraries_installed(libraries: list[str]):
-    for lib_name in libraries:
-        result = run_cli(["arduino-cli", "lib", "install", lib_name])
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "stage": "lib_install",
-                    "message": f"Failed installing {lib_name}: {result.stderr or result.stdout}",
-                },
-            )
-
+# CLANGD 
 @app.websocket("/lsp/clangd")
-async def clangd_bridge(websocket: WebSocket, fqbn: str = "arduino:avr:uno", filename: str = "sketch.ino"):
+async def clangd_bridge(
+    websocket: WebSocket,
+    fqbn: str = "arduino:avr:uno",
+    filename: str = "sketch.ino",
+):
+    filename = Path(filename).name
+    if (
+        not ENABLE_LSP
+        or fqbn not in ALLOWED_FQBN
+        or Path(filename).suffix.lower() not in ALLOWED_EXT
+    ):
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
 
     session_id = str(uuid.uuid4())
@@ -767,23 +347,32 @@ async def clangd_bridge(websocket: WebSocket, fqbn: str = "arduino:avr:uno", fil
     workspace.mkdir(parents=True, exist_ok=True)
     workspace_abs = workspace.resolve()
 
-    write_compile_commands(workspace, fqbn, filename)
+    await asyncio.to_thread(write_compile_commands, workspace, fqbn, filename)
     (workspace / filename).write_text("", encoding="utf-8")
 
-    await websocket.send_text(json.dumps({
-        "type": "workspace-info",
-        "path": str(workspace_abs).replace("\\", "/"),
-    }))
-
-
-    process = await asyncio.create_subprocess_exec(
-        "clangd", "--background-index",
-        f"--compile-commands-dir={workspace}",
-        cwd=str(workspace),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+    await websocket.send_text(
+        json.dumps(
+            {
+                "type": "workspace-info",
+                "path": str(workspace_abs).replace("\\", "/"),
+            }
+        )
     )
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "clangd",
+            "--background-index",
+            f"--compile-commands-dir={workspace}",
+            cwd=str(workspace),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        shutil.rmtree(workspace, ignore_errors=True)
+        await websocket.close(code=1011)
+        return
 
     async def ws_to_clangd():
         try:
@@ -810,9 +399,7 @@ async def clangd_bridge(websocket: WebSocket, fqbn: str = "arduino:avr:uno", fil
         buffer = b""
         while True:
             chunk = await process.stdout.read(4096)
-            print("RAW FROM CLANGD:", chunk)
             if not chunk:
-                print("CLANGD STDOUT CLOSED")
                 break
             buffer += chunk
             while True:
@@ -821,8 +408,7 @@ async def clangd_bridge(websocket: WebSocket, fqbn: str = "arduino:avr:uno", fil
                     break
                 try:
                     await websocket.send_text(msg.decode("utf-8"))
-                except Exception as e:
-                    print("SEND TO BROWSER FAILED:", e)
+                except Exception:
                     return
 
     try:
@@ -833,7 +419,6 @@ async def clangd_bridge(websocket: WebSocket, fqbn: str = "arduino:avr:uno", fil
 
 
 def try_extract_message(buffer: bytes):
-    """Parse one Content-Length-framed LSP message from buffer."""
     header_end = buffer.find(b"\r\n\r\n")
     if header_end == -1:
         return None, buffer, False
@@ -849,10 +434,10 @@ def try_extract_message(buffer: bytes):
 
     body_start = header_end + 4
     if len(buffer) < body_start + length:
-        return None, buffer, False  
+        return None, buffer, False
 
-    msg = buffer[body_start:body_start + length]
-    rest = buffer[body_start + length:]
+    msg = buffer[body_start : body_start + length]
+    rest = buffer[body_start + length :]
     return msg, rest, True
 
 
@@ -860,18 +445,14 @@ def get_arduino_include_flags(fqbn: str) -> list[str]:
     if fqbn in _board_flags_cache:
         return _board_flags_cache[fqbn]
 
-    probe_dir = Path("clangd_probe") / fqbn.replace(":", "_")
+    probe_dir = Path("clangd_probe") / fqbn.replace(":", "_")  
     probe_dir.mkdir(parents=True, exist_ok=True)
     probe_ino = probe_dir / f"{probe_dir.name}.ino"
     probe_ino.write_text("void setup() {}\nvoid loop() {}\n")
 
-    result = run_cli([
-        "arduino-cli", "compile",
-        "--fqbn", fqbn,
-        "-v",
-        "--clean",
-        str(probe_dir),
-    ])
+    result = run_cli(
+        ["arduino-cli", "compile", "--fqbn", fqbn, "-v", "--clean", str(probe_dir)]
+    )
 
     compile_line = None
     for line in result.stdout.splitlines():
@@ -881,39 +462,49 @@ def get_arduino_include_flags(fqbn: str) -> list[str]:
 
     flags: list[str] = []
     if compile_line:
-        flags += ['-I' + p for p in re.findall(r'"-I([^"]+)"', compile_line)]
+        flags += ["-I" + p for p in re.findall(r'"-I([^"]+)"', compile_line)]
         flags += re.findall(r'(?<!")(-I[^\s"]+)', compile_line)
-        flags += re.findall(r'(-D\S+)', compile_line)
-
-    print("EXTRACTED FLAGS:", flags)
+        flags += re.findall(r"(-D\S+)", compile_line)
 
     shutil.rmtree(probe_dir, ignore_errors=True)
     _board_flags_cache[fqbn] = flags
     return flags
 
+
+def find_avr_libc_include() -> Path | None:
+    roots = [
+        Path(os.getenv("ARDUINO_DATA_DIR", "")) if os.getenv("ARDUINO_DATA_DIR") else None,
+        Path.home() / "AppData" / "Local" / "Arduino15",
+        Path.home() / ".arduino15",
+    ]
+    for root in roots:
+        if root is None:
+            continue
+        matches = sorted(root.glob("packages/arduino/tools/avr-gcc/*/avr/include"))
+        if matches:
+            return matches[-1]
+    return None
+
+
 def write_compile_commands(workspace: Path, fqbn: str, main_filename: str):
     flags = get_arduino_include_flags(fqbn)
-
-    avr_gcc_root = Path("C:/Users/Asus/AppData/Local/Arduino15/packages/arduino/tools/avr-gcc/7.3.0-atmel3.6.1-arduino7")
-    avr_libc_include = avr_gcc_root / "avr" / "include"
+    avr_libc_include = find_avr_libc_include()
 
     arguments = [
         "clang++",
         "--target=avr",
         "-mmcu=atmega328p",
         "-x", "c++", "-std=gnu++11", "-fpermissive", "-fno-exceptions",
-        f"-I{avr_libc_include}",
-        *flags,
-        "-include", "Arduino.h",
-        main_filename,
     ]
+    if avr_libc_include:
+        arguments.append(f"-I{avr_libc_include}")
+    arguments += [*flags, "-include", "Arduino.h", main_filename]
 
-    entry = [{
-        "directory": str(workspace.resolve()),
-        "arguments": arguments,
-        "file": main_filename,
-    }]
-    content = json.dumps(entry)
-    print("COMPILE_COMMANDS.JSON CONTENT:", content)
-    (workspace / "compile_commands.json").write_text(content)
-
+    entry = [
+        {
+            "directory": str(workspace.resolve()),
+            "arguments": arguments,
+            "file": main_filename,
+        }
+    ]
+    (workspace / "compile_commands.json").write_text(json.dumps(entry))

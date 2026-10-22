@@ -561,6 +561,8 @@ async function uploadCode() {
         throw new Error(`Flashing ${fqbn} is not supported yet.`);
       }
       compileResult.value.message = "Upload successful!";
+      await new Promise((r) => setTimeout(r, 1500)); // let the board re-enumerate
+      await detectBoards();
     } catch (e) {
       compileResult.value.success = false;
       compileResult.value.error = `Upload failed: ${e}`;
