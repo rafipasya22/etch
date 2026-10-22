@@ -6,14 +6,14 @@ import "../Blockly/blocks/arduino";
 import { arduinoGenerator } from "../Blockly/generators/arduino";
 import { arduinoDarkTheme } from "../Blockly/theme";
 import { getInstalledLibraryToolboxContents } from "../lib/registry";
+import { API_BASE } from "../lib/api";
+
 import "../lib/generators"; // registers forBlock generators for library blocks
 
 const blocklyContainer = ref<HTMLElement | null>(null);
 
 let workspace: Blockly.WorkspaceSvg | null = null;
 let resizeObserver: ResizeObserver | null = null;
-
-const API_BASE = "http://localhost:8000";
 
 function generateCode() {
   if (!workspace) return "";

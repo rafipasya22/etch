@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from "vue";
+import { API_BASE } from "../lib/api";
 
 const emit = defineEmits<{
   libraryChanged: [];
@@ -20,7 +21,6 @@ interface InstalledLibrary {
   author: string;
 }
 
-const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
 const searchQuery = ref("");
 const searchedQuery = ref("");

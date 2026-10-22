@@ -3,6 +3,7 @@ import { onMounted, onBeforeUnmount, watch, ref } from "vue";
 import Themes from "monaco-editor-themes";
 import { LspClient } from "../editor/lsp";
 import * as monaco from "monaco-editor";
+import { WS_BASE } from "../lib/api";
 
 interface SketchFile {
   id: string;
@@ -93,7 +94,7 @@ function notifyDidOpen(file: SketchFile) {
 }
 
 function notifyDidChange(file: SketchFile, newContent: string) {
-  if (!lspReady) return; // skip kalau LSP belum siap; isi terbaru udah ke-capture pas didOpen jalan nanti
+  if (!lspReady) return;
   const version = (documentVersions.get(file.id) ?? 1) + 1;
   documentVersions.set(file.id, version);
   lsp?.notify("textDocument/didChange", {
@@ -186,10 +187,10 @@ async function initLsp() {
   const fname = encodeURIComponent(activeFile.filename);
 
   lsp = new LspClient(
-    `ws://localhost:8000/lsp/clangd?fqbn=${fqbn}&filename=${fname}`,
+    `${WS_BASE}/lsp/clangd?fqbn=${fqbn}&filename=${fname}`,
   );
 
-  const workspacePath = await lsp.workspacePath; // tunggu path asli dari backend
+  const workspacePath = await lsp.workspacePath; 
   currentWorkspacePath = workspacePath;
 
   try {

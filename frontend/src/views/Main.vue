@@ -10,6 +10,7 @@ import { useAuth } from "../stores/auth";
 import Libs from "../components/Libs.vue";
 import { watch, computed, nextTick, onMounted, ref, markRaw } from "vue";
 import { flashEsp32, flashAvr } from "../lib/flasher";
+import { API_BASE as API } from "../lib/api";
 
 // ============================================================
 // PROPS
@@ -27,7 +28,6 @@ const props = withDefaults(
   },
 );
 
-const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 const radius = computed(() => 25 - props.strokeWidth / 2);
 const circumference = computed(() => 2 * Math.PI * radius.value);
 
