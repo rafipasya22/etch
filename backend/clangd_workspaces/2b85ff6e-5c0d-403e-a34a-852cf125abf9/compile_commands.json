@@ -1,1 +1,0 @@
-[{"directory": "clangd_workspaces\\2b85ff6e-5c0d-403e-a34a-852cf125abf9", "command": "clang++ -x c++ -std=c++17 -Iclangd_workspaces\\2b85ff6e-5c0d-403e-a34a-852cf125abf9 sketch.ino", "file": "sketch.ino"}]
