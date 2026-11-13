@@ -1,5 +1,0 @@
---flash-mode dio --flash-freq 80m --flash-size 4MB  
-0x1000 02a0af6e-2864-4ecc-97ca-02b05e4b740c.ino.bootloader.bin  
-0x8000 02a0af6e-2864-4ecc-97ca-02b05e4b740c.ino.partitions.bin  
-0xe000 boot_app0.bin  
-0x10000 02a0af6e-2864-4ecc-97ca-02b05e4b740c.ino.bin 
